@@ -7605,25 +7605,27 @@ class TTrainer(TryTrainer):
         super().__init__(plans, configuration, fold, dataset_json, device)
         
         import sys
-        # 输出到stdout和stderr以确保可见性
-        msg = "\n" + "="*80 + "\n"
-        msg += "🔥🔥🔥 初始化TTrainer - 层次化Mamba创新训练器 🔥🔥🔥\n"
-        msg += "="*80 + "\n"
-        msg += "✅ 继承TryTrainer的hybrid注意力和损失函数\n"
-        msg += "🎯 添加层次化Mamba创新:\n"
-        msg += "   - 浅层(1-2): 局部感知Mamba\n"
-        msg += "   - 中层(3): 层次化Mamba\n"
-        msg += "   - 深层(瓶颈): 条件选择性Mamba\n"
-        msg += "   - 解码器: 语义引导Mamba细化\n"
-        msg += "="*80 + "\n"
         
-        # 输出到stdout
-        print(msg, flush=True)
-        sys.stdout.flush()
+        # 定义辅助函数用于多渠道输出
+        def log_init_message(msg):
+            print(msg, flush=True)
+            sys.stdout.flush()
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+            # 使用nnUNet logger（如果可用）
+            if hasattr(self, 'print_to_log_file'):
+                self.print_to_log_file(msg)
         
-        # 同时输出到stderr以防stdout被重定向
-        sys.stderr.write(msg)
-        sys.stderr.flush()
+        log_init_message("\n" + "="*80)
+        log_init_message("🔥🔥🔥 初始化TTrainer - 层次化Mamba创新训练器 🔥🔥🔥")
+        log_init_message("="*80)
+        log_init_message("✅ 继承TryTrainer的hybrid注意力和损失函数")
+        log_init_message("🎯 添加层次化Mamba创新:")
+        log_init_message("   - 浅层(1-2): 局部感知Mamba")
+        log_init_message("   - 中层(3): 层次化Mamba")
+        log_init_message("   - 深层(瓶颈): 条件选择性Mamba")
+        log_init_message("   - 解码器: 语义引导Mamba细化")
+        log_init_message("="*80)
         
         # 检测是2D还是3D配置
         self.is_2d = False
@@ -7649,12 +7651,8 @@ class TTrainer(TryTrainer):
                 'downsample_factor': 2,
                 'use_mamba': True  # 启用2D Mamba
             }
-            msg = f"✅✅✅ 检测到2D配置，将使用2D Mamba模块 ✅✅✅\n"
-            msg += f"📐 窗口大小: {self.mamba_config['window_size']}\n"
-            print(msg, flush=True)
-            sys.stdout.flush()
-            sys.stderr.write(msg)
-            sys.stderr.flush()
+            log_init_message(f"✅✅✅ 检测到2D配置，将使用2D Mamba模块 ✅✅✅")
+            log_init_message(f"📐 窗口大小: {self.mamba_config['window_size']}")
         else:
             # 3D配置：使用完整Mamba
             self.mamba_config = {
@@ -7666,12 +7664,8 @@ class TTrainer(TryTrainer):
                 'downsample_factor': 2,
                 'use_mamba': True
             }
-            msg = f"✅✅✅ 检测到3D配置，将使用3D Mamba模块 ✅✅✅\n"
-            msg += f"📐 窗口大小: {self.mamba_config['window_size']}\n"
-            print(msg, flush=True)
-            sys.stdout.flush()
-            sys.stderr.write(msg)
-            sys.stderr.flush()
+            log_init_message(f"✅✅✅ 检测到3D配置，将使用3D Mamba模块 ✅✅✅")
+            log_init_message(f"📐 窗口大小: {self.mamba_config['window_size']}")
         
         # 初始化Mamba模块容器
         self.encoder_mamba_modules = nn.ModuleDict()
@@ -7680,25 +7674,34 @@ class TTrainer(TryTrainer):
         
         # 标记Mamba是否已添加
         self.ttrainer_mamba_added = False
-        msg = "⏳ Mamba模块将在网络初始化时添加...\n\n"
-        print(msg, flush=True)
-        sys.stdout.flush()
-        sys.stderr.write(msg)
-        sys.stderr.flush()
+        log_init_message("⏳ Mamba模块将在网络初始化时添加...")
+        log_init_message("")
     
     def initialize_network(self):
         """重写网络初始化以集成层次化Mamba"""
         import sys
-        msg = "\n" + "="*80 + "\n"
-        msg += "🌟🌟🌟 开始网络初始化 - TTrainer 🌟🌟🌟\n"
-        msg += "="*80 + "\n"
-        print(msg, flush=True)
-        sys.stdout.flush()
-        sys.stderr.write(msg)
-        sys.stderr.flush()
+        
+        # 定义一个辅助函数，同时输出到多个渠道
+        def log_message(msg):
+            # 1. 标准输出
+            print(msg, flush=True)
+            sys.stdout.flush()
+            # 2. 标准错误
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+            # 3. 使用nnUNet的logger（如果可用）
+            if hasattr(self, 'print_to_log_file'):
+                self.print_to_log_file(msg)
+        
+        msg = "\n" + "="*80
+        log_message(msg)
+        log_message("🌟🌟🌟 开始网络初始化 - TTrainer 🌟🌟🌟")
+        log_message("="*80)
         
         # 先调用父类初始化（包括TryTrainer的注意力）
         super().initialize_network()
+        
+        log_message("\n✅ 父类网络初始化完成")
         
         # 从实际网络架构提取通道信息
         self._extract_network_channels()
@@ -7708,41 +7711,21 @@ class TTrainer(TryTrainer):
         
         if use_mamba and not self.ttrainer_mamba_added:
             if MAMBA_AVAILABLE:
-                msg = f"\n🚀🚀🚀 准备添加Mamba模块 ({'2D' if self.is_2d else '3D'}模式)... 🚀🚀🚀\n"
-                print(msg, flush=True)
-                sys.stdout.flush()
-                sys.stderr.write(msg)
-                sys.stderr.flush()
+                log_message(f"\n🚀🚀🚀 准备添加Mamba模块 ({'2D' if self.is_2d else '3D'}模式)... 🚀🚀🚀")
                 
                 self._add_hierarchical_mamba_to_network()
                 self.ttrainer_mamba_added = True
                 
-                msg = "\n✅✅✅ Mamba模块成功集成到网络中! ✅✅✅\n"
-                print(msg, flush=True)
-                sys.stdout.flush()
-                sys.stderr.write(msg)
-                sys.stderr.flush()
+                log_message("\n✅✅✅ Mamba模块成功集成到网络中! ✅✅✅")
             else:
-                msg = "\n⚠️⚠️⚠️ mamba-ssm库不可用，Mamba模块将自动降级为卷积实现 ⚠️⚠️⚠️\n"
-                print(msg, flush=True)
-                sys.stdout.flush()
-                sys.stderr.write(msg)
-                sys.stderr.flush()
+                log_message("\n⚠️⚠️⚠️ mamba-ssm库不可用，Mamba模块将自动降级为卷积实现 ⚠️⚠️⚠️")
                 
                 self._add_hierarchical_mamba_to_network()
                 self.ttrainer_mamba_added = True
                 
-                msg = "\n✅✅✅ Mamba模块(卷积替代)已添加到网络中! ✅✅✅\n"
-                print(msg, flush=True)
-                sys.stdout.flush()
-                sys.stderr.write(msg)
-                sys.stderr.flush()
+                log_message("\n✅✅✅ Mamba模块(卷积替代)已添加到网络中! ✅✅✅")
         elif not use_mamba:
-            msg = "\n⚠️ Mamba模块已在配置中禁用，将使用标准卷积\n"
-            print(msg, flush=True)
-            sys.stdout.flush()
-            sys.stderr.write(msg)
-            sys.stderr.flush()
+            log_message("\n⚠️ Mamba模块已在配置中禁用，将使用标准卷积")
 
     
     def _extract_network_channels(self):
@@ -7792,13 +7775,19 @@ class TTrainer(TryTrainer):
     def _add_hierarchical_mamba_to_network(self):
         """添加层次化Mamba到网络的不同阶段"""
         import sys
-        msg = "\n" + "="*80 + "\n"
-        msg += f"🔥🔥🔥 添加层次化Mamba模块到网络 ({'2D' if self.is_2d else '3D'}模式)... 🔥🔥🔥\n"
-        msg += "="*80 + "\n"
-        print(msg, flush=True)
-        sys.stdout.flush()
-        sys.stderr.write(msg)
-        sys.stderr.flush()
+        
+        # 定义辅助函数用于多渠道输出
+        def log_mamba_message(msg):
+            print(msg, flush=True)
+            sys.stdout.flush()
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+            if hasattr(self, 'print_to_log_file'):
+                self.print_to_log_file(msg)
+        
+        log_mamba_message("\n" + "="*80)
+        log_mamba_message(f"🔥🔥🔥 添加层次化Mamba模块到网络 ({'2D' if self.is_2d else '3D'}模式)... 🔥🔥🔥")
+        log_mamba_message("="*80)
         
         # 选择正确的模块类（2D或3D）
         if self.is_2d:
@@ -7820,8 +7809,7 @@ class TTrainer(TryTrainer):
         for stage_idx in [0, 1]:
             if stage_idx < len(self.encoder_channels):
                 channels = self.encoder_channels[stage_idx]
-                print(f"\n📍 阶段 {stage_idx+1}: 添加局部感知Mamba{dim_str} (channels={channels})", flush=True)
-                sys.stdout.flush()
+                log_mamba_message(f"\n📍 阶段 {stage_idx+1}: 添加局部感知Mamba{dim_str} (channels={channels})")
                 
                 mamba_module = LocalMamba(
                     channels=channels,
@@ -7832,15 +7820,13 @@ class TTrainer(TryTrainer):
                     expand=self.mamba_config['expand']
                 )
                 self.encoder_mamba_modules[f'stage_{stage_idx}'] = mamba_module
-                print(f"  ✅ 局部感知Mamba{dim_str}已添加", flush=True)
-                sys.stdout.flush()
+                log_mamba_message(f"  ✅ 局部感知Mamba{dim_str}已添加")
         
         # 2. 中层（第3阶段）：层次化Mamba
         stage_idx = 2
         if stage_idx < len(self.encoder_channels):
             channels = self.encoder_channels[stage_idx]
-            print(f"\n📍 阶段 {stage_idx+1}: 添加层次化Mamba{dim_str} (channels={channels})", flush=True)
-            sys.stdout.flush()
+            log_mamba_message(f"\n📍 阶段 {stage_idx+1}: 添加层次化Mamba{dim_str} (channels={channels})")
             
             mamba_module = HierarchicalMamba(
                 channels=channels,
@@ -7851,13 +7837,11 @@ class TTrainer(TryTrainer):
                 expand=self.mamba_config['expand']
             )
             self.encoder_mamba_modules[f'stage_{stage_idx}'] = mamba_module
-            print(f"  ✅ 层次化Mamba{dim_str}已添加", flush=True)
-            sys.stdout.flush()
+            log_mamba_message(f"  ✅ 层次化Mamba{dim_str}已添加")
         
         # 3. 深层（瓶颈）：条件选择性Mamba
         bottleneck_channels = self.encoder_channels[-1]
-        print(f"\n📍 瓶颈层: 添加条件选择性Mamba{dim_str} (channels={bottleneck_channels})", flush=True)
-        sys.stdout.flush()
+        log_mamba_message(f"\n📍 瓶颈层: 添加条件选择性Mamba{dim_str} (channels={bottleneck_channels})")
         
         self.bottleneck_mamba = ConditionalSelectiveMamba(
             channels=bottleneck_channels,
@@ -7866,12 +7850,10 @@ class TTrainer(TryTrainer):
             d_conv=self.mamba_config['d_conv'],
             expand=self.mamba_config['expand']
         )
-        print(f"  ✅ 条件选择性Mamba{dim_str}已添加", flush=True)
-        sys.stdout.flush()
+        log_mamba_message(f"  ✅ 条件选择性Mamba{dim_str}已添加")
         
         # 4. 解码器：语义引导Mamba细化模块
-        print(f"\n📍 解码器: 添加语义引导Mamba{dim_str}细化模块", flush=True)
-        sys.stdout.flush()
+        log_mamba_message(f"\n📍 解码器: 添加语义引导Mamba{dim_str}细化模块")
         # 解码器每个上采样阶段都添加
         for i in range(len(self.decoder_channels) - 1):
             up_channels = self.decoder_channels[i]
@@ -7886,8 +7868,7 @@ class TTrainer(TryTrainer):
                 expand=self.mamba_config['expand']
             )
             self.decoder_sg_mamba_modules[f'decoder_{i}'] = sg_mamba
-            print(f"  ✅ 解码器阶段 {i}: SG-Mamba{dim_str} (up={up_channels}, skip={skip_channels})", flush=True)
-        sys.stdout.flush()
+            log_mamba_message(f"  ✅ 解码器阶段 {i}: SG-Mamba{dim_str} (up={up_channels}, skip={skip_channels})")
         
         # 移动所有Mamba模块到设备
         self.encoder_mamba_modules.to(self.device)
@@ -7900,13 +7881,12 @@ class TTrainer(TryTrainer):
         total_params += sum(p.numel() for p in self.bottleneck_mamba.parameters()) if self.bottleneck_mamba else 0
         total_params += sum(p.numel() for p in self.decoder_sg_mamba_modules.parameters())
         
-        print(f"\n🎉🎉🎉 层次化Mamba{dim_str}模块添加完成! 🎉🎉🎉", flush=True)
-        print(f"  配置维度: {'2D (H, W)' if self.is_2d else '3D (D, H, W)'}", flush=True)
-        print(f"  窗口大小: {self.mamba_config['window_size']}", flush=True)
-        print(f"  总Mamba参数: {total_params:,}", flush=True)
-        print(f"  Mamba可用性: {'✅ 使用mamba-ssm' if MAMBA_AVAILABLE else '⚠️ 使用CNN替代'}", flush=True)
-        print("="*80 + "\n", flush=True)
-        sys.stdout.flush()
+        log_mamba_message(f"\n🎉🎉🎉 层次化Mamba{dim_str}模块添加完成! 🎉🎉🎉")
+        log_mamba_message(f"  配置维度: {'2D (H, W)' if self.is_2d else '3D (D, H, W)'}")
+        log_mamba_message(f"  窗口大小: {self.mamba_config['window_size']}")
+        log_mamba_message(f"  总Mamba参数: {total_params:,}")
+        log_mamba_message(f"  Mamba可用性: {'✅ 使用mamba-ssm' if MAMBA_AVAILABLE else '⚠️ 使用CNN替代'}")
+        log_mamba_message("="*80)
         
         # 集成Mamba到网络前向传播
         self._integrate_mamba_into_forward()
