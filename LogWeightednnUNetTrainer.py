@@ -6836,6 +6836,382 @@ class HeyTrainer(nnUNetTrainer):
 # 继承TryTrainer，保持相同的hybrid注意力和损失函数
 # 添加层次化Mamba创新：局部感知、层次化、条件选择性、语义引导
 
+# ================ 2D Mamba模块 ================
+class WindowPartition2D(nn.Module):
+    """2D窗口划分模块 - 用于局部感知Mamba"""
+    def __init__(self, window_size=(8, 8), overlap_ratio=0.5):
+        super().__init__()
+        self.window_size = window_size
+        self.overlap_ratio = overlap_ratio
+        # 计算重叠大小
+        self.overlap = tuple(int(w * overlap_ratio) for w in window_size)
+        
+    def forward(self, x):
+        """
+        划分为重叠窗口
+        x: (B, C, H, W)
+        返回: (B, num_windows, C, wh, ww)
+        """
+        B, C, H, W = x.shape
+        wh, ww = self.window_size
+        stride = tuple(w - o for w, o in zip(self.window_size, self.overlap))
+        
+        # 使用unfold实现重叠窗口
+        windows = x.unfold(2, wh, stride[0]).unfold(3, ww, stride[1])
+        # windows: (B, C, nH, nW, wh, ww)
+        
+        # 重排为 (B, num_windows, C, wh, ww)
+        nH, nW = windows.shape[2:4]
+        windows = windows.permute(0, 2, 3, 1, 4, 5).contiguous()
+        windows = windows.view(B, nH * nW, C, wh, ww)
+        
+        return windows, (nH, nW)
+
+class WindowMerge2D(nn.Module):
+    """2D窗口合并模块"""
+    def __init__(self, window_size=(8, 8), overlap_ratio=0.5):
+        super().__init__()
+        self.window_size = window_size
+        self.overlap_ratio = overlap_ratio
+        self.overlap = tuple(int(w * overlap_ratio) for w in window_size)
+        
+    def forward(self, windows, window_grid, original_shape):
+        """
+        合并重叠窗口
+        windows: (B, num_windows, C, wh, ww)
+        window_grid: (nH, nW)
+        original_shape: (H, W)
+        """
+        B, num_windows, C, wh, ww = windows.shape
+        nH, nW = window_grid
+        H, W = original_shape
+        
+        # 重构输出张量
+        output = torch.zeros(B, C, H, W, device=windows.device, dtype=windows.dtype)
+        count = torch.zeros(B, C, H, W, device=windows.device, dtype=windows.dtype)
+        
+        stride = tuple(w - o for w, o in zip(self.window_size, self.overlap))
+        
+        idx = 0
+        for h in range(nH):
+            for w in range(nW):
+                h_start = h * stride[0]
+                w_start = w * stride[1]
+                
+                h_end = min(h_start + wh, H)
+                w_end = min(w_start + ww, W)
+                
+                wh_actual = h_end - h_start
+                ww_actual = w_end - w_start
+                
+                output[:, :, h_start:h_end, w_start:w_end] += \
+                    windows[:, idx, :, :wh_actual, :ww_actual]
+                count[:, :, h_start:h_end, w_start:w_end] += 1
+                
+                idx += 1
+        
+        # 平均重叠区域
+        output = output / (count + 1e-6)
+        return output
+
+class LocalMamba2D(nn.Module):
+    """局部感知Mamba - 2D版本，在窗口内独立应用Mamba"""
+    def __init__(self, channels, window_size=(8, 8), overlap_ratio=0.5,
+                 d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.channels = channels
+        self.window_partition = WindowPartition2D(window_size, overlap_ratio)
+        self.window_merge = WindowMerge2D(window_size, overlap_ratio)
+        
+        # 如果Mamba可用，使用Mamba；否则使用卷积模拟
+        if MAMBA_AVAILABLE:
+            # Mamba在每个窗口内独立处理
+            self.mamba = Mamba(
+                d_model=channels,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand
+            )
+        else:
+            # 降级到深度可分离卷积
+            self.mamba = nn.Sequential(
+                nn.Conv2d(channels, channels, 3, padding=1, groups=channels),
+                nn.BatchNorm2d(channels),
+                nn.SiLU(),
+                nn.Conv2d(channels, channels, 1)
+            )
+        
+    def forward(self, x):
+        """
+        x: (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        
+        # 1. 窗口划分
+        windows, grid = self.window_partition(x)  # (B, num_windows, C, wh, ww)
+        B, num_windows, C, wh, ww = windows.shape
+        
+        # 2. 在每个窗口内应用Mamba
+        if MAMBA_AVAILABLE:
+            # Mamba需要序列输入 (B, L, C)
+            windows_flat = windows.view(B * num_windows, C, wh * ww)
+            windows_flat = windows_flat.permute(0, 2, 1)  # (B*num_windows, L, C)
+            
+            # 应用Mamba
+            windows_processed = self.mamba(windows_flat)  # (B*num_windows, L, C)
+            
+            # 恢复形状
+            windows_processed = windows_processed.permute(0, 2, 1)  # (B*num_windows, C, L)
+            windows_processed = windows_processed.view(B, num_windows, C, wh, ww)
+        else:
+            # 使用卷积
+            windows_flat = windows.view(B * num_windows, C, wh, ww)
+            windows_processed = self.mamba(windows_flat)
+            windows_processed = windows_processed.view(B, num_windows, C, wh, ww)
+        
+        # 3. 窗口合并
+        output = self.window_merge(windows_processed, grid, (H, W))
+        
+        return output
+
+class HierarchicalMamba2D(nn.Module):
+    """层次化Mamba - 2D版本，并行全局和局部路径"""
+    def __init__(self, channels, window_size=(8, 8), 
+                 downsample_factor=2, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.channels = channels
+        self.downsample_factor = downsample_factor
+        
+        # 路径A: 全局Mamba（处理下采样特征）
+        self.global_downsample = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=downsample_factor, 
+                     stride=downsample_factor, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU()
+        )
+        
+        if MAMBA_AVAILABLE:
+            self.global_mamba = Mamba(
+                d_model=channels,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand
+            )
+        else:
+            self.global_mamba = nn.Sequential(
+                nn.Conv2d(channels, channels, 3, padding=1),
+                nn.BatchNorm2d(channels),
+                nn.SiLU()
+            )
+        
+        self.global_upsample = nn.Sequential(
+            nn.ConvTranspose2d(channels, channels, kernel_size=downsample_factor,
+                              stride=downsample_factor, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU()
+        )
+        
+        # 路径B: 局部窗口Mamba
+        self.local_mamba = LocalMamba2D(
+            channels=channels,
+            window_size=window_size,
+            overlap_ratio=0.5,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
+        )
+        
+        # 融合层
+        self.fusion = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU()
+        )
+        
+    def forward(self, x):
+        """
+        x: (B, C, H, W)
+        """
+        # 路径A: 全局
+        x_down = self.global_downsample(x)  # 下采样
+        
+        if MAMBA_AVAILABLE:
+            B, C, H, W = x_down.shape
+            x_down_flat = x_down.view(B, C, H * W).permute(0, 2, 1)
+            x_global = self.global_mamba(x_down_flat)
+            x_global = x_global.permute(0, 2, 1).view(B, C, H, W)
+        else:
+            x_global = self.global_mamba(x_down)
+        
+        x_global = self.global_upsample(x_global)  # 上采样回原尺寸
+        
+        # 路径B: 局部
+        x_local = self.local_mamba(x)
+        
+        # 融合
+        x_fused = torch.cat([x_global, x_local], dim=1)
+        output = self.fusion(x_fused)
+        
+        return output
+
+class ConditionalSelectiveMamba2D(nn.Module):
+    """条件选择性Mamba - 2D版本，参数由类别先验动态生成"""
+    def __init__(self, channels, num_classes, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.channels = channels
+        self.num_classes = num_classes
+        
+        # 轻量子网络：从类别先验生成Mamba参数
+        self.condition_network = nn.Sequential(
+            nn.Linear(num_classes, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+        
+        # 生成选择性扫描参数
+        self.param_generator = nn.ModuleDict({
+            'dt_scale': nn.Linear(64, channels),
+            'dt_shift': nn.Linear(64, channels),
+            'B_scale': nn.Linear(64, d_state),
+            'C_scale': nn.Linear(64, d_state),
+        })
+        
+        # 主Mamba模块
+        if MAMBA_AVAILABLE:
+            self.mamba = Mamba(
+                d_model=channels,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand
+            )
+        else:
+            # 降级方案
+            self.mamba = nn.Sequential(
+                nn.Conv2d(channels, channels * expand, 1),
+                nn.BatchNorm2d(channels * expand),
+                nn.SiLU(),
+                nn.Conv2d(channels * expand, channels, 1)
+            )
+        
+    def forward(self, x, class_priors):
+        """
+        x: (B, C, H, W)
+        class_priors: (B, num_classes) - 每个样本的类别先验统计
+        """
+        B, C, H, W = x.shape
+        
+        # 生成条件参数
+        condition_feat = self.condition_network(class_priors)  # (B, 64)
+        
+        # 生成选择性参数
+        dt_scale = torch.sigmoid(self.param_generator['dt_scale'](condition_feat))  # (B, C)
+        dt_shift = self.param_generator['dt_shift'](condition_feat)  # (B, C)
+        
+        if MAMBA_AVAILABLE:
+            # 将x转为序列
+            x_flat = x.view(B, C, H * W).permute(0, 2, 1)  # (B, L, C)
+            
+            # 应用条件调制
+            x_flat = x_flat * dt_scale.unsqueeze(1) + dt_shift.unsqueeze(1)
+            
+            # Mamba处理
+            x_processed = self.mamba(x_flat)  # (B, L, C)
+            
+            # 恢复形状
+            output = x_processed.permute(0, 2, 1).view(B, C, H, W)
+        else:
+            # 降级方案：直接应用卷积
+            output = self.mamba(x)
+        
+        return output
+
+class SemanticGuidedMambaRefinement2D(nn.Module):
+    """语义引导的Mamba细化模块 - 2D版本，用于解码器"""
+    def __init__(self, up_channels, skip_channels, num_classes, 
+                 d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.up_channels = up_channels
+        self.skip_channels = skip_channels
+        self.num_classes = num_classes
+        
+        # 融合通道
+        self.fused_channels = up_channels + skip_channels
+        
+        # 全局类别向量映射为类别引导信号
+        self.class_guide_mapper = nn.Sequential(
+            nn.Linear(num_classes, 128),
+            nn.ReLU(),
+            nn.Linear(128, self.fused_channels),
+            nn.Sigmoid()  # 作为门控信号
+        )
+        
+        # 特征融合
+        self.feature_fusion = nn.Sequential(
+            nn.Conv2d(self.fused_channels, self.fused_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(self.fused_channels),
+            nn.SiLU()
+        )
+        
+        # Mamba细化（受类别引导影响）
+        if MAMBA_AVAILABLE:
+            self.mamba_refine = Mamba(
+                d_model=self.fused_channels,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand
+            )
+        else:
+            self.mamba_refine = nn.Sequential(
+                nn.Conv2d(self.fused_channels, self.fused_channels * expand, 3, padding=1),
+                nn.BatchNorm2d(self.fused_channels * expand),
+                nn.SiLU(),
+                nn.Conv2d(self.fused_channels * expand, self.fused_channels, 3, padding=1)
+            )
+        
+        # 输出投影
+        self.output_proj = nn.Sequential(
+            nn.Conv2d(self.fused_channels, up_channels, 1, bias=False),
+            nn.BatchNorm2d(up_channels)
+        )
+        
+    def forward(self, f_up, f_skip, global_class_vec):
+        """
+        f_up: (B, up_channels, H, W) - 上采样特征
+        f_skip: (B, skip_channels, H, W) - 跳跃连接特征
+        global_class_vec: (B, num_classes) - 全局类别向量
+        """
+        B = f_up.shape[0]
+        
+        # 1. 融合特征
+        f_fused = torch.cat([f_up, f_skip], dim=1)  # (B, fused_channels, H, W)
+        f_fused = self.feature_fusion(f_fused)
+        
+        # 2. 生成类别引导信号
+        class_guide = self.class_guide_mapper(global_class_vec)  # (B, fused_channels)
+        class_guide = class_guide.view(B, -1, 1, 1)  # (B, fused_channels, 1, 1)
+        
+        # 3. 应用类别引导（门控机制）
+        f_guided = f_fused * class_guide
+        
+        # 4. Mamba细化
+        if MAMBA_AVAILABLE:
+            B, C, H, W = f_guided.shape
+            f_flat = f_guided.view(B, C, H * W).permute(0, 2, 1)  # (B, L, C)
+            f_refined = self.mamba_refine(f_flat)  # (B, L, C)
+            f_refined = f_refined.permute(0, 2, 1).view(B, C, H, W)
+        else:
+            f_refined = self.mamba_refine(f_guided)
+        
+        # 5. 残差连接
+        f_refined = f_refined + f_guided
+        
+        # 6. 输出投影
+        output = self.output_proj(f_refined)
+        
+        return output
+
+# ================ 3D Mamba模块 ================
 class WindowPartition3D(nn.Module):
     """3D窗口划分模块 - 用于局部感知Mamba"""
     def __init__(self, window_size=(4, 4, 4), overlap_ratio=0.5):
@@ -7240,30 +7616,30 @@ class TTrainer(TryTrainer):
         print("="*80 + "\n")
         
         # 检测是2D还是3D配置
-        is_2d = False
+        self.is_2d = False
         if hasattr(self, 'configuration_name'):
-            is_2d = '2d' in self.configuration_name.lower()
+            self.is_2d = '2d' in self.configuration_name.lower()
         elif hasattr(self, 'configuration_manager'):
             # 尝试从configuration_manager检测
             try:
                 conv_op = self.configuration_manager.configuration['architecture']['arch_kwargs']['conv_op']
-                is_2d = 'Conv2d' in conv_op
+                self.is_2d = 'Conv2d' in conv_op
             except:
                 pass
         
         # Mamba模块配置 - 根据2D/3D调整
-        if is_2d:
-            # 2D配置：不使用窗口分割，直接降级到卷积
+        if self.is_2d:
+            # 2D配置：使用2D窗口大小和Mamba模块
             self.mamba_config = {
                 'd_state': 16,
                 'd_conv': 4,
                 'expand': 2,
-                'window_size': None,  # 2D不使用窗口
+                'window_size': (8, 8),  # 2D窗口大小
                 'overlap_ratio': 0.5,
                 'downsample_factor': 2,
-                'use_mamba': False  # 2D禁用Mamba，使用卷积替代
+                'use_mamba': True  # 启用2D Mamba
             }
-            print(f"⚠️ 检测到2D配置，Mamba模块将使用卷积替代")
+            print(f"✅ 检测到2D配置，将使用2D Mamba模块")
         else:
             # 3D配置：使用完整Mamba
             self.mamba_config = {
@@ -7292,15 +7668,23 @@ class TTrainer(TryTrainer):
         # 从实际网络架构提取通道信息
         self._extract_network_channels()
         
-        # 添加层次化Mamba模块（仅当配置允许且Mamba可用时）
-        use_mamba = self.mamba_config.get('use_mamba', True) and MAMBA_AVAILABLE
+        # 添加层次化Mamba模块
+        use_mamba = self.mamba_config.get('use_mamba', True)
+        
         if use_mamba and not self.ttrainer_mamba_added:
-            self._add_hierarchical_mamba_to_network()
-            self.ttrainer_mamba_added = True
+            if MAMBA_AVAILABLE:
+                print(f"\n🚀 准备添加Mamba模块 ({'2D' if self.is_2d else '3D'}模式)...")
+                self._add_hierarchical_mamba_to_network()
+                self.ttrainer_mamba_added = True
+                print(f"\n✅ Mamba模块成功集成到网络中!")
+            else:
+                print(f"\n⚠️ mamba-ssm库不可用，Mamba模块将自动降级为卷积实现")
+                self._add_hierarchical_mamba_to_network()
+                self.ttrainer_mamba_added = True
+                print(f"\n✅ Mamba模块(卷积替代)已添加到网络中!")
         elif not use_mamba:
-            print(f"\n⚠️ Mamba模块已禁用（2D配置或配置要求），将使用标准卷积")
-        elif not MAMBA_AVAILABLE:
-            print(f"\n⚠️ mamba-ssm不可用，将使用卷积替代")
+            print(f"\n⚠️ Mamba模块已在配置中禁用，将使用标准卷积")
+
     
     def _extract_network_channels(self):
         """从实际网络架构中提取编码器和解码器通道数"""
@@ -7349,19 +7733,32 @@ class TTrainer(TryTrainer):
     def _add_hierarchical_mamba_to_network(self):
         """添加层次化Mamba到网络的不同阶段"""
         print("\n" + "="*80)
-        print("🔥 添加层次化Mamba模块到网络...")
+        print(f"🔥 添加层次化Mamba模块到网络 ({'2D' if self.is_2d else '3D'}模式)...")
         print("="*80)
         
-        # 假设encoder_channels = [32, 64, 128, 256, 320]
-        # 阶段划分: stage 0-1 (浅层), stage 2 (中层), stage 3-4 (深层/瓶颈)
+        # 选择正确的模块类（2D或3D）
+        if self.is_2d:
+            LocalMamba = LocalMamba2D
+            HierarchicalMamba = HierarchicalMamba2D
+            ConditionalSelectiveMamba = ConditionalSelectiveMamba2D
+            SemanticGuidedMamba = SemanticGuidedMambaRefinement2D
+            dim_str = "2D"
+        else:
+            LocalMamba = LocalMamba3D
+            HierarchicalMamba = HierarchicalMamba3D
+            ConditionalSelectiveMamba = ConditionalSelectiveMamba3D
+            SemanticGuidedMamba = SemanticGuidedMambaRefinement
+            dim_str = "3D"
+        
+        # 阶段划分: stage 0-1 (浅层), stage 2 (中层), stage 3+ (深层/瓶颈)
         
         # 1. 浅层（第1-2阶段）：局部感知Mamba
         for stage_idx in [0, 1]:
             if stage_idx < len(self.encoder_channels):
                 channels = self.encoder_channels[stage_idx]
-                print(f"\n📍 阶段 {stage_idx+1}: 添加局部感知Mamba (channels={channels})")
+                print(f"\n📍 阶段 {stage_idx+1}: 添加局部感知Mamba{dim_str} (channels={channels})")
                 
-                mamba_module = LocalMamba3D(
+                mamba_module = LocalMamba(
                     channels=channels,
                     window_size=self.mamba_config['window_size'],
                     overlap_ratio=self.mamba_config['overlap_ratio'],
@@ -7370,15 +7767,15 @@ class TTrainer(TryTrainer):
                     expand=self.mamba_config['expand']
                 )
                 self.encoder_mamba_modules[f'stage_{stage_idx}'] = mamba_module
-                print(f"  ✅ 局部感知Mamba已添加")
+                print(f"  ✅ 局部感知Mamba{dim_str}已添加")
         
         # 2. 中层（第3阶段）：层次化Mamba
         stage_idx = 2
         if stage_idx < len(self.encoder_channels):
             channels = self.encoder_channels[stage_idx]
-            print(f"\n📍 阶段 {stage_idx+1}: 添加层次化Mamba (channels={channels})")
+            print(f"\n📍 阶段 {stage_idx+1}: 添加层次化Mamba{dim_str} (channels={channels})")
             
-            mamba_module = HierarchicalMamba3D(
+            mamba_module = HierarchicalMamba(
                 channels=channels,
                 window_size=self.mamba_config['window_size'],
                 downsample_factor=self.mamba_config['downsample_factor'],
@@ -7387,29 +7784,29 @@ class TTrainer(TryTrainer):
                 expand=self.mamba_config['expand']
             )
             self.encoder_mamba_modules[f'stage_{stage_idx}'] = mamba_module
-            print(f"  ✅ 层次化Mamba已添加")
+            print(f"  ✅ 层次化Mamba{dim_str}已添加")
         
         # 3. 深层（瓶颈）：条件选择性Mamba
         bottleneck_channels = self.encoder_channels[-1]
-        print(f"\n📍 瓶颈层: 添加条件选择性Mamba (channels={bottleneck_channels})")
+        print(f"\n📍 瓶颈层: 添加条件选择性Mamba{dim_str} (channels={bottleneck_channels})")
         
-        self.bottleneck_mamba = ConditionalSelectiveMamba3D(
+        self.bottleneck_mamba = ConditionalSelectiveMamba(
             channels=bottleneck_channels,
             num_classes=self.num_classes,
             d_state=self.mamba_config['d_state'],
             d_conv=self.mamba_config['d_conv'],
             expand=self.mamba_config['expand']
         )
-        print(f"  ✅ 条件选择性Mamba已添加")
+        print(f"  ✅ 条件选择性Mamba{dim_str}已添加")
         
         # 4. 解码器：语义引导Mamba细化模块
-        print(f"\n📍 解码器: 添加语义引导Mamba细化模块")
+        print(f"\n📍 解码器: 添加语义引导Mamba{dim_str}细化模块")
         # 解码器每个上采样阶段都添加
         for i in range(len(self.decoder_channels) - 1):
             up_channels = self.decoder_channels[i]
             skip_channels = self.encoder_channels[-(i+2)] if i < len(self.encoder_channels) - 1 else up_channels
             
-            sg_mamba = SemanticGuidedMambaRefinement(
+            sg_mamba = SemanticGuidedMamba(
                 up_channels=up_channels,
                 skip_channels=skip_channels,
                 num_classes=self.num_classes,
@@ -7418,7 +7815,7 @@ class TTrainer(TryTrainer):
                 expand=self.mamba_config['expand']
             )
             self.decoder_sg_mamba_modules[f'decoder_{i}'] = sg_mamba
-            print(f"  ✅ 解码器阶段 {i}: SG-Mamba (up={up_channels}, skip={skip_channels})")
+            print(f"  ✅ 解码器阶段 {i}: SG-Mamba{dim_str} (up={up_channels}, skip={skip_channels})")
         
         # 移动所有Mamba模块到设备
         self.encoder_mamba_modules.to(self.device)
@@ -7431,8 +7828,11 @@ class TTrainer(TryTrainer):
         total_params += sum(p.numel() for p in self.bottleneck_mamba.parameters()) if self.bottleneck_mamba else 0
         total_params += sum(p.numel() for p in self.decoder_sg_mamba_modules.parameters())
         
-        print(f"\n🎉 层次化Mamba模块添加完成!")
+        print(f"\n🎉 层次化Mamba{dim_str}模块添加完成!")
+        print(f"  配置维度: {'2D (H, W)' if self.is_2d else '3D (D, H, W)'}")
+        print(f"  窗口大小: {self.mamba_config['window_size']}")
         print(f"  总Mamba参数: {total_params:,}")
+        print(f"  Mamba可用性: {'✅ 使用mamba-ssm' if MAMBA_AVAILABLE else '⚠️ 使用CNN替代'}")
         print("="*80 + "\n")
         
         # 集成Mamba到网络前向传播
