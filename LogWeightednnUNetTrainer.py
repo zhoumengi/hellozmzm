@@ -7239,15 +7239,42 @@ class TTrainer(TryTrainer):
         print(f"   - 解码器: 语义引导Mamba细化")
         print("="*80 + "\n")
         
-        # Mamba模块配置
-        self.mamba_config = {
-            'd_state': 16,
-            'd_conv': 4,
-            'expand': 2,
-            'window_size': (4, 4, 4),
-            'overlap_ratio': 0.5,
-            'downsample_factor': 2
-        }
+        # 检测是2D还是3D配置
+        is_2d = False
+        if hasattr(self, 'configuration_name'):
+            is_2d = '2d' in self.configuration_name.lower()
+        elif hasattr(self, 'configuration_manager'):
+            # 尝试从configuration_manager检测
+            try:
+                conv_op = self.configuration_manager.configuration['architecture']['arch_kwargs']['conv_op']
+                is_2d = 'Conv2d' in conv_op
+            except:
+                pass
+        
+        # Mamba模块配置 - 根据2D/3D调整
+        if is_2d:
+            # 2D配置：不使用窗口分割，直接降级到卷积
+            self.mamba_config = {
+                'd_state': 16,
+                'd_conv': 4,
+                'expand': 2,
+                'window_size': None,  # 2D不使用窗口
+                'overlap_ratio': 0.5,
+                'downsample_factor': 2,
+                'use_mamba': False  # 2D禁用Mamba，使用卷积替代
+            }
+            print(f"⚠️ 检测到2D配置，Mamba模块将使用卷积替代")
+        else:
+            # 3D配置：使用完整Mamba
+            self.mamba_config = {
+                'd_state': 16,
+                'd_conv': 4,
+                'expand': 2,
+                'window_size': (4, 4, 4),
+                'overlap_ratio': 0.5,
+                'downsample_factor': 2,
+                'use_mamba': True
+            }
         
         # 初始化Mamba模块容器
         self.encoder_mamba_modules = nn.ModuleDict()
@@ -7262,10 +7289,62 @@ class TTrainer(TryTrainer):
         # 先调用父类初始化（包括TryTrainer的注意力）
         super().initialize_network()
         
-        # 添加层次化Mamba模块
-        if MAMBA_AVAILABLE and not self.ttrainer_mamba_added:
+        # 从实际网络架构提取通道信息
+        self._extract_network_channels()
+        
+        # 添加层次化Mamba模块（仅当配置允许且Mamba可用时）
+        use_mamba = self.mamba_config.get('use_mamba', True) and MAMBA_AVAILABLE
+        if use_mamba and not self.ttrainer_mamba_added:
             self._add_hierarchical_mamba_to_network()
             self.ttrainer_mamba_added = True
+        elif not use_mamba:
+            print(f"\n⚠️ Mamba模块已禁用（2D配置或配置要求），将使用标准卷积")
+        elif not MAMBA_AVAILABLE:
+            print(f"\n⚠️ mamba-ssm不可用，将使用卷积替代")
+    
+    def _extract_network_channels(self):
+        """从实际网络架构中提取编码器和解码器通道数"""
+        try:
+            # 尝试从configuration_manager获取
+            if hasattr(self, 'configuration_manager') and hasattr(self.configuration_manager, 'configuration'):
+                config = self.configuration_manager.configuration
+                if 'architecture' in config and 'arch_kwargs' in config['architecture']:
+                    arch_kwargs = config['architecture']['arch_kwargs']
+                    if 'features_per_stage' in arch_kwargs:
+                        features = arch_kwargs['features_per_stage']
+                        self.encoder_channels = features
+                        self.decoder_channels = list(reversed(features))
+                        print(f"\n📊 从configuration提取通道信息:")
+                        print(f"  编码器通道: {self.encoder_channels}")
+                        print(f"  解码器通道: {self.decoder_channels}")
+                        return
+            
+            # 如果上述方法失败，使用父类的默认值（如果存在）
+            if not hasattr(self, 'encoder_channels'):
+                # 2D和3D的默认配置
+                if hasattr(self, 'configuration_name') and '2d' in self.configuration_name.lower():
+                    # 2D默认配置（7阶段）
+                    self.encoder_channels = [32, 64, 128, 256, 512, 512, 512]
+                    self.decoder_channels = [512, 512, 512, 256, 128, 64, 32]
+                else:
+                    # 3D默认配置（5阶段）- 保持原有的
+                    if not hasattr(self, 'encoder_channels'):
+                        self.encoder_channels = [32, 64, 128, 256, 320]
+                    if not hasattr(self, 'decoder_channels'):
+                        self.decoder_channels = [320, 256, 128, 64, 32]
+                
+                print(f"\n📊 使用默认通道配置:")
+                print(f"  编码器通道: {self.encoder_channels}")
+                print(f"  解码器通道: {self.decoder_channels}")
+        
+        except Exception as e:
+            print(f"\n⚠️ 提取网络通道信息失败: {e}")
+            # 使用安全的默认值
+            if not hasattr(self, 'encoder_channels'):
+                self.encoder_channels = [32, 64, 128, 256, 320]
+            if not hasattr(self, 'decoder_channels'):
+                self.decoder_channels = [320, 256, 128, 64, 32]
+            print(f"  使用回退默认值: encoder={self.encoder_channels}")
     
     def _add_hierarchical_mamba_to_network(self):
         """添加层次化Mamba到网络的不同阶段"""
