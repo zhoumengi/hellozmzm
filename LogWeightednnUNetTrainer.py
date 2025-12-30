@@ -7709,6 +7709,8 @@ class TTrainer(TryTrainer):
         # 添加层次化Mamba模块
         use_mamba = self.mamba_config.get('use_mamba', True)
         
+        log_message(f"\n🔍 调试信息: use_mamba={use_mamba}, ttrainer_mamba_added={self.ttrainer_mamba_added}, MAMBA_AVAILABLE={MAMBA_AVAILABLE}")
+        
         if use_mamba and not self.ttrainer_mamba_added:
             if MAMBA_AVAILABLE:
                 log_message(f"\n🚀🚀🚀 准备添加Mamba模块 ({'2D' if self.is_2d else '3D'}模式)... 🚀🚀🚀")
@@ -7726,6 +7728,8 @@ class TTrainer(TryTrainer):
                 log_message("\n✅✅✅ Mamba模块(卷积替代)已添加到网络中! ✅✅✅")
         elif not use_mamba:
             log_message("\n⚠️ Mamba模块已在配置中禁用，将使用标准卷积")
+        else:
+            log_message("\n⚠️ Mamba模块已经添加过，跳过重复添加")
 
     
     def _extract_network_channels(self):
